@@ -4,13 +4,23 @@ import numpy as np
 from datetime import datetime
 import io
 from collections import defaultdict
+import altair as alt
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 
 st.set_page_config(page_title="Agent Fraud Detector", layout="centered")
-st.title("🕵️ Agent Fraud & Suspicious Task Detector-N")
+st.title("🕵️ Agent Fraud & Suspicious Task Detector-NA")
+
+@st.cache_data(show_spinner=False)
+def merge_files(files):
+    merged_df = pd.DataFrame()
+    for file in files:
+        df = read_file(file)
+        merged_df = pd.concat([merged_df, df], ignore_index=True)
+    return merged_df
 
 uploaded_files = st.file_uploader("Upload Excel Files (.xlsx or .xlsb)", type=["xlsx", "xlsb"], accept_multiple_files=True)
 
-# Unified column mapping (case-insensitive)
 HEADER_MAPPING = {
     'timestamp': ['VerificationTimestamp', 'Gpay SpSaleDate'],
     'pincode': ['Pincode'],
@@ -41,13 +51,6 @@ def read_file(file):
         df = pd.read_excel(file)
     return normalize_columns(df)
 
-def merge_files(files):
-    merged_df = pd.DataFrame()
-    for file in files:
-        df = read_file(file)
-        merged_df = pd.concat([merged_df, df], ignore_index=True)
-    return merged_df
-
 def haversine_np(lat1, lon1, lat2, lon2):
     R = 6371
     lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
@@ -64,68 +67,103 @@ def run_checks(df):
     df['is_suspicious'] = ''
     df['flag_reason'] = ''
 
-    # Rule 1 & 2: vectorized short time and large distance check
-    for (agent, date), group in df.groupby(['agent_id', 'date']):
-        group = group.sort_values('timestamp')
-        group['prev_time'] = group['timestamp'].shift(1)
-        group['time_diff'] = (group['timestamp'] - group['prev_time']).dt.total_seconds() / 60
-        group['prev_lat'] = group['latitude'].shift(1)
-        group['prev_lon'] = group['longitude'].shift(1)
+    df['prev_time'] = df.groupby(['agent_id', 'date'])['timestamp'].shift(1)
+    df['prev_lat'] = df.groupby(['agent_id', 'date'])['latitude'].shift(1)
+    df['prev_lon'] = df.groupby(['agent_id', 'date'])['longitude'].shift(1)
 
-        mask_valid_coords = group[['latitude', 'longitude', 'prev_lat', 'prev_lon']].notna().all(axis=1)
-        group.loc[mask_valid_coords, 'dist'] = haversine_np(
-            group.loc[mask_valid_coords, 'latitude'],
-            group.loc[mask_valid_coords, 'longitude'],
-            group.loc[mask_valid_coords, 'prev_lat'],
-            group.loc[mask_valid_coords, 'prev_lon']
-        )
+    df['time_diff'] = (df['timestamp'] - df['prev_time']).dt.total_seconds() / 60
+    valid_coords = df[['latitude', 'longitude', 'prev_lat', 'prev_lon']].notna().all(axis=1)
+    df['dist'] = np.nan
+    df.loc[valid_coords, 'dist'] = haversine_np(
+        df.loc[valid_coords, 'latitude'],
+        df.loc[valid_coords, 'longitude'],
+        df.loc[valid_coords, 'prev_lat'],
+        df.loc[valid_coords, 'prev_lon']
+    )
 
-        for idx, row in group.iterrows():
-            reasons = []
-            if pd.notna(row.get('time_diff')) and row['time_diff'] < 5:
-                reasons.append(f"Short time gap: {row['time_diff']:.1f} mins")
-            if pd.notna(row.get('dist')) and row['dist'] > 30 and row['time_diff'] < 60:
-                reasons.append(f"Large distance: {row['dist']:.1f} km in {row['time_diff']:.1f} mins")
-            if reasons:
-                df.at[idx, 'is_suspicious'] = 'Yes'
-                df.at[idx, 'flag_reason'] = '; '.join(reasons)
+    mask_short_time = df['time_diff'] < 5
+    df.loc[mask_short_time, 'is_suspicious'] = 'Yes'
+    df.loc[mask_short_time, 'flag_reason'] += 'Short time gap; '
 
-    # Rule 3: top volume agents
+    mask_large_dist = (df['dist'] > 30) & (df['time_diff'] < 60)
+    df.loc[mask_large_dist, 'is_suspicious'] = 'Yes'
+    df.loc[mask_large_dist, 'flag_reason'] += 'Large distance gap; '
+
     volume_by_agent = df.groupby(['agent_id', 'date']).size()
     threshold = volume_by_agent.quantile(0.95)
-    flagged = volume_by_agent[volume_by_agent >= threshold].index
-    for agent, date in flagged:
-        mask = (df['agent_id'] == agent) & (df['date'] == date)
-        df.loc[mask, 'flag_reason'] += '; High task volume'
-        df.loc[mask, 'is_suspicious'] = 'Yes'
+    flagged_agents = volume_by_agent[volume_by_agent >= threshold].index
+    high_task_mask = df.set_index(['agent_id', 'date']).index.isin(flagged_agents)
+    df.loc[high_task_mask, 'is_suspicious'] = 'Yes'
+    df.loc[high_task_mask, 'flag_reason'] += 'High task volume; '
 
-    # Rule 4: same MerchantExternalId multiple times
     if 'merchant_id' in df.columns:
         merchant_counts = df['merchant_id'].value_counts()
-        flagged_merchants = merchant_counts[merchant_counts > 3].index
-        df.loc[df['merchant_id'].isin(flagged_merchants), 'flag_reason'] += '; Repeated Merchant ID'
-        df.loc[df['merchant_id'].isin(flagged_merchants), 'is_suspicious'] = 'Yes'
+        repeated_merchants = merchant_counts[merchant_counts > 3].index
+        repeat_mask = df['merchant_id'].isin(repeated_merchants)
+        df.loc[repeat_mask, 'is_suspicious'] = 'Yes'
+        df.loc[repeat_mask, 'flag_reason'] += 'Repeated Merchant ID; '
 
-    # Rule 5: same phone number for different merchants
     if 'mobile_no' in df.columns and 'merchant_id' in df.columns:
-        phone_merchant = df.groupby('mobile_no')['merchant_id'].nunique()
-        suspicious_phones = phone_merchant[phone_merchant > 1].index
-        df.loc[df['mobile_no'].isin(suspicious_phones), 'flag_reason'] += '; Same phone, multiple merchants'
-        df.loc[df['mobile_no'].isin(suspicious_phones), 'is_suspicious'] = 'Yes'
+        phone_merchant_counts = df.groupby('mobile_no')['merchant_id'].nunique()
+        suspicious_phones = phone_merchant_counts[phone_merchant_counts > 1].index
+        phone_mask = df['mobile_no'].isin(suspicious_phones)
+        df.loc[phone_mask, 'is_suspicious'] = 'Yes'
+        df.loc[phone_mask, 'flag_reason'] += 'Same phone, multiple merchants; '
 
-    # Rule 6: low internal reporting vs high lead
     if 'entry_status' in df.columns:
-        internal = df[df['entry_status'].str.contains("yes", case=False, na=False)]
-        external = df.groupby('agent_id').size()
-        internal_count = internal.groupby('agent_id').size()
-        for agent in external.index:
-            ext = external[agent]
-            intr = internal_count.get(agent, 0)
-            if intr < 2 and ext >= 10:
-                df.loc[df['agent_id'] == agent, 'flag_reason'] += '; Low internal, high leads'
-                df.loc[df['agent_id'] == agent, 'is_suspicious'] = 'Yes'
+        external_counts = df.groupby('agent_id').size()
+        internal_counts = df[df['entry_status'].str.contains("yes", case=False, na=False)].groupby('agent_id').size()
+        under_reporting = external_counts[external_counts >= 10].index.difference(internal_counts[internal_counts >= 2].index)
+        low_internal_mask = df['agent_id'].isin(under_reporting)
+        df.loc[low_internal_mask, 'is_suspicious'] = 'Yes'
+        df.loc[low_internal_mask, 'flag_reason'] += 'Low internal, high leads; '
+
+    # New: Clustering agents with similar behavior
+    if 'latitude' in df.columns and 'longitude' in df.columns:
+        cluster_data = df[['latitude', 'longitude']].dropna()
+        if not cluster_data.empty:
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(cluster_data)
+            kmeans = KMeans(n_clusters=min(5, len(cluster_data)), random_state=0, n_init='auto')
+            df.loc[cluster_data.index, 'cluster'] = kmeans.fit_predict(X_scaled)
+
+    # New: Back-to-back entries with identical lat/lon but different agents
+    df['next_agent'] = df['agent_id'].shift(-1)
+    df['next_lat'] = df['latitude'].shift(-1)
+    df['next_lon'] = df['longitude'].shift(-1)
+    match_mask = (df['agent_id'] != df['next_agent']) & \
+                 (df['latitude'] == df['next_lat']) & \
+                 (df['longitude'] == df['next_lon'])
+    df.loc[match_mask, 'is_suspicious'] = 'Yes'
+    df.loc[match_mask, 'flag_reason'] += 'Same location diff agent; '
 
     return df
+
+def show_charts(df):
+    st.markdown("### 📊 Summary Charts")
+
+    if 'agent_id' in df.columns:
+        chart = alt.Chart(df).mark_bar().encode(
+            x=alt.X('agent_id:N', title='Agent ID'),
+            y=alt.Y('count():Q', title='Suspicious Leads'),
+            color=alt.value('crimson'),
+            tooltip=['agent_id', 'count()']
+        ).transform_filter(
+            alt.datum.is_suspicious == 'Yes'
+        ).properties(height=400, width=700, title="Suspicious Leads per Agent")
+        st.altair_chart(chart, use_container_width=True)
+
+    if 'flag_reason' in df.columns:
+        reasons = df[df['is_suspicious'] == 'Yes']['flag_reason'].str.split(';', expand=True).stack()
+        reasons = reasons.str.strip().value_counts().reset_index()
+        reasons.columns = ['Reason', 'Count']
+        chart2 = alt.Chart(reasons).mark_bar().encode(
+            x=alt.X('Reason:N', sort='-y'),
+            y=alt.Y('Count:Q'),
+            color=alt.value('orange'),
+            tooltip=['Reason', 'Count']
+        ).properties(width=700, height=300, title="Breakdown of Flag Reasons")
+        st.altair_chart(chart2, use_container_width=True)
 
 if uploaded_files:
     st.success(f"{len(uploaded_files)} file(s) uploaded successfully.")
@@ -140,10 +178,12 @@ if uploaded_files:
     st.markdown(f"### 🚨 {len(suspicious)} Suspicious Entries Found")
     st.dataframe(suspicious)
 
+    show_charts(flagged_df)
+
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         flagged_df.to_excel(writer, index=False, sheet_name='All Data')
         suspicious.to_excel(writer, index=False, sheet_name='Suspicious Only')
 
-    st.download_button("📅 Download Flagged Report", data=output.getvalue(),
+    st.download_button("🗕️ Download Flagged Report", data=output.getvalue(),
                        file_name="suspicious_task_report.xlsx")
