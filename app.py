@@ -1,12 +1,12 @@
 import streamlit as st
 import pandas as pd
-from geopy.distance import geodesic
+import numpy as np
 from datetime import datetime
 import io
 from collections import defaultdict
 
 st.set_page_config(page_title="Agent Fraud Detector", layout="centered")
-st.title("🕵️ Agent Fraud & Suspicious Task Detector-updated")
+st.title("🕵️ Agent Fraud & Suspicious Task Detector")
 
 uploaded_files = st.file_uploader("Upload Excel Files (.xlsx or .xlsb)", type=["xlsx", "xlsb"], accept_multiple_files=True)
 
@@ -48,8 +48,13 @@ def merge_files(files):
         merged_df = pd.concat([merged_df, df], ignore_index=True)
     return merged_df
 
-def is_valid_coord(lat, lon):
-    return pd.notna(lat) and pd.notna(lon) and isinstance(lat, (int, float)) and isinstance(lon, (int, float))
+def haversine_np(lat1, lon1, lat2, lon2):
+    R = 6371
+    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
+    return 2 * R * np.arcsin(np.sqrt(a))
 
 def run_checks(df):
     df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
@@ -59,38 +64,40 @@ def run_checks(df):
     df['is_suspicious'] = ''
     df['flag_reason'] = ''
 
-    # Rule 1 & 2: short time or large distance
+    # Rule 1 & 2: vectorized short time and large distance check
     for (agent, date), group in df.groupby(['agent_id', 'date']):
         group = group.sort_values('timestamp')
-        prev_row = None
+        group['prev_time'] = group['timestamp'].shift(1)
+        group['time_diff'] = (group['timestamp'] - group['prev_time']).dt.total_seconds() / 60
+        group['prev_lat'] = group['latitude'].shift(1)
+        group['prev_lon'] = group['longitude'].shift(1)
+
+        mask_valid_coords = group[['latitude', 'longitude', 'prev_lat', 'prev_lon']].notna().all(axis=1)
+        group.loc[mask_valid_coords, 'dist'] = haversine_np(
+            group.loc[mask_valid_coords, 'latitude'],
+            group.loc[mask_valid_coords, 'longitude'],
+            group.loc[mask_valid_coords, 'prev_lat'],
+            group.loc[mask_valid_coords, 'prev_lon']
+        )
+
         for idx, row in group.iterrows():
             reasons = []
-            if prev_row is not None:
-                time_diff = (row['timestamp'] - prev_row['timestamp']).total_seconds() / 60
-                if time_diff < 5:
-                    reasons.append(f"Short time gap: {time_diff:.1f} mins")
-
-                if is_valid_coord(row.get('latitude'), row.get('longitude')) and \
-                   is_valid_coord(prev_row.get('latitude'), prev_row.get('longitude')):
-                    dist = geodesic(
-                        (prev_row['latitude'], prev_row['longitude']),
-                        (row['latitude'], row['longitude'])
-                    ).km
-                    if dist > 30 and time_diff < 60:
-                        reasons.append(f"Large distance: {dist:.1f} km in {time_diff:.1f} mins")
-
+            if pd.notna(row.get('time_diff')) and row['time_diff'] < 5:
+                reasons.append(f"Short time gap: {row['time_diff']:.1f} mins")
+            if pd.notna(row.get('dist')) and row['dist'] > 30 and row['time_diff'] < 60:
+                reasons.append(f"Large distance: {row['dist']:.1f} km in {row['time_diff']:.1f} mins")
             if reasons:
                 df.at[idx, 'is_suspicious'] = 'Yes'
                 df.at[idx, 'flag_reason'] = '; '.join(reasons)
-            prev_row = row
 
     # Rule 3: top volume agents
     volume_by_agent = df.groupby(['agent_id', 'date']).size()
     threshold = volume_by_agent.quantile(0.95)
-    for (agent, date), count in volume_by_agent.items():
-        if count >= threshold:
-            df.loc[(df['agent_id'] == agent) & (df['date'] == date), 'flag_reason'] += '; High task volume'
-            df.loc[(df['agent_id'] == agent) & (df['date'] == date), 'is_suspicious'] = 'Yes'
+    flagged = volume_by_agent[volume_by_agent >= threshold].index
+    for agent, date in flagged:
+        mask = (df['agent_id'] == agent) & (df['date'] == date)
+        df.loc[mask, 'flag_reason'] += '; High task volume'
+        df.loc[mask, 'is_suspicious'] = 'Yes'
 
     # Rule 4: same MerchantExternalId multiple times
     if 'merchant_id' in df.columns:
@@ -125,7 +132,9 @@ if uploaded_files:
     merged_df = merge_files(uploaded_files)
     st.write("Merged Preview:", merged_df.head())
 
-    flagged_df = run_checks(merged_df)
+    with st.spinner("Running fraud detection checks..."):
+        flagged_df = run_checks(merged_df)
+
     suspicious = flagged_df[flagged_df['is_suspicious'] == 'Yes']
 
     st.markdown(f"### 🚨 {len(suspicious)} Suspicious Entries Found")
