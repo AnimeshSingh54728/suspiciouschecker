@@ -1,5 +1,8 @@
 streamlit
 pandas
-geopy
+numpy
 openpyxl
 pyxlsb
+geopy
+altair
+scikit-learn
