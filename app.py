@@ -25,7 +25,6 @@ HEADER_MAPPING = {
 
 REVERSE_MAPPING = {col.lower(): unified for unified, cols in HEADER_MAPPING.items() for col in cols}
 
-
 def normalize_columns(df):
     col_map = {}
     for col in df.columns:
@@ -35,14 +34,12 @@ def normalize_columns(df):
     df = df.rename(columns=col_map)
     return df
 
-
 def read_file(file):
     if file.name.endswith(".xlsb"):
         df = pd.read_excel(file, engine="pyxlsb")
     else:
         df = pd.read_excel(file)
     return normalize_columns(df)
-
 
 def merge_files(files):
     merged_df = pd.DataFrame()
@@ -51,6 +48,8 @@ def merge_files(files):
         merged_df = pd.concat([merged_df, df], ignore_index=True)
     return merged_df
 
+def is_valid_coord(lat, lon):
+    return pd.notna(lat) and pd.notna(lon) and isinstance(lat, (int, float)) and isinstance(lon, (int, float))
 
 def run_checks(df):
     df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
@@ -71,10 +70,11 @@ def run_checks(df):
                 if time_diff < 5:
                     reasons.append(f"Short time gap: {time_diff:.1f} mins")
 
-                if 'latitude' in row and 'longitude' in row and pd.notna(row['latitude']) and pd.notna(row['longitude']):
+                if is_valid_coord(row.get('latitude'), row.get('longitude')) and \
+                   is_valid_coord(prev_row.get('latitude'), prev_row.get('longitude')):
                     dist = geodesic(
-                        (prev_row.get('latitude', 0), prev_row.get('longitude', 0)),
-                        (row.get('latitude', 0), row.get('longitude', 0))
+                        (prev_row['latitude'], prev_row['longitude']),
+                        (row['latitude'], row['longitude'])
                     ).km
                     if dist > 30 and time_diff < 60:
                         reasons.append(f"Large distance: {dist:.1f} km in {time_diff:.1f} mins")
@@ -120,7 +120,6 @@ def run_checks(df):
 
     return df
 
-
 if uploaded_files:
     st.success(f"{len(uploaded_files)} file(s) uploaded successfully.")
     merged_df = merge_files(uploaded_files)
@@ -137,6 +136,5 @@ if uploaded_files:
         flagged_df.to_excel(writer, index=False, sheet_name='All Data')
         suspicious.to_excel(writer, index=False, sheet_name='Suspicious Only')
 
-    st.download_button("📥 Download Flagged Report", data=output.getvalue(),
+    st.download_button("📅 Download Flagged Report", data=output.getvalue(),
                        file_name="suspicious_task_report.xlsx")
-
