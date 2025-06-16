@@ -6,7 +6,7 @@ import io
 from collections import defaultdict
 
 st.set_page_config(page_title="Agent Fraud Detector", layout="centered")
-st.title("🕵️ Agent Fraud & Suspicious Task Detector")
+st.title("🕵️ Agent Fraud & Suspicious Task Detector-updated")
 
 uploaded_files = st.file_uploader("Upload Excel Files (.xlsx or .xlsb)", type=["xlsx", "xlsb"], accept_multiple_files=True)
 
